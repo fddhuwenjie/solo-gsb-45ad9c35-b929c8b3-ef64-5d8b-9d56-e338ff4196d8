@@ -40,6 +40,8 @@ from .models import (
     ProfileCorrectionPreviewRequest,
     ProfileCorrectionPreviewResponse,
     ShipmentBatchOut,
+    ShipmentReissueRequest,
+    ShipmentReissueResponse,
     ShipmentSnapshotRequest,
     ShipmentSnapshotResponse,
     from_epoch,
@@ -55,7 +57,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="冷链温区异常归因 API",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "按装卸/运输区段的温度上下限检测连续越界，容忍短暂回落、"
         "跨采样缺口拆段，并按异常区间内实际采样时刻数量将异常归因到"
@@ -67,7 +69,11 @@ app = FastAPI(
         "以原档案与拟定区间分别重算各批次摘要，列出需重新核对的处置与联单。"
         "处置结论录错可提交更正：同一事务内核对原案件所属批次与重算摘要后"
         "原子写入新案件与替代关系，被替代案件不得再开新联单，"
-        "更正响应按联单号排序列出需重新出具的联单。"
+        "更正响应按联单号排序列出需重新出具的联单。案件更正后可依据已有"
+        "联单换发新联单：新单沿用原单批次顺序与 handoff_at，仅替换指定"
+        "批次的案件，服务在同一事务内逐批次重算摘要并核对新单案件有效后"
+        "原子写入新联单与换发关系；同一原单只能换发一次，相同请求幂等回放，"
+        "新单可继续换发，原单内容与同号回放保持历史快照。"
     ),
     lifespan=lifespan,
 )
@@ -1270,6 +1276,90 @@ def _build_shipment_response(
     )
 
 
+def _recompute_shipment_batch_conn(
+    conn: Any, batch_id: str, pos: str
+) -> tuple[list[dict[str, Any]], str]:
+    """联单核对：在事务内重算批次异常并返回 (异常列表, 当前摘要)。
+
+    批次不存在按 404 拒绝（仅普通建单路径会出现；换发批次均来自原单行）。
+    """
+    batch_row = db._select_batch(conn, batch_id)
+    if batch_row is None:
+        raise HTTPException(
+            status_code=404, detail=f"{pos} 不存在，请先提交分析"
+        )
+    stored_batch = {
+        "batch": dict(batch_row),
+        "anomalies": db._select_anomalies(conn, batch_id),
+    }
+    # 重算并在同一事务内得到当前摘要（旧口径行会先被重算结果覆盖）。
+    _device_id, anomalies, profile_descriptor = _recompute_batch_conn(
+        conn, stored_batch
+    )
+    return anomalies, _analysis_digest(anomalies, profile_descriptor)
+
+
+def _check_case_for_shipment_conn(
+    conn: Any,
+    pos: str,
+    batch_id: str,
+    case_id: str,
+    current_digest: str,
+    anomalies: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """联单核对：案件存在、属于该批次、未被替代、依据当前快照且覆盖全部异常。
+
+    任一条件不满足按 409 拒绝（事务随异常回滚）。普通建单与联单换发共用
+    同一套规则，返回案件行供结果（open/closed）计算。
+    """
+    case = db.get_case_for_update(conn, case_id)
+    if case is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{pos} 缺少处置：案件 case_id={case_id} 不存在，"
+                "请先提交处置复核"
+            ),
+        )
+    case_row = case["case"]
+    if case_row["batch_id"] != batch_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{pos} 的案件 case_id={case_id} 实际属于批次 "
+                f"{case_row['batch_id']}，案件与批次不匹配"
+            ),
+        )
+    replaced_by = db.get_correction_by_original(conn, case_id)
+    if replaced_by is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{pos} 的案件 case_id={case_id} 已被更正为案件 "
+                f"{replaced_by['new_case_id']}，被替代案件不得用于"
+                "新联单；请改用更正后的新案件"
+            ),
+        )
+    if case_row["analysis_digest"] != current_digest:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{pos} 的案件 case_id={case_id} 处置依据的快照"
+                "与当前异常不一致，未覆盖当前异常"
+            ),
+        )
+    covered = {d["seq"] for d in case["decisions"]}
+    if covered != set(range(len(anomalies))):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{pos} 的案件 case_id={case_id} 处置未覆盖当前"
+                f"全部异常（共 {len(anomalies)} 条）"
+            ),
+        )
+    return case_row
+
+
 @app.post("/api/v1/shipments/snapshot", response_model=ShipmentSnapshotResponse)
 def create_shipment_snapshot(
     req: ShipmentSnapshotRequest, response: Response
@@ -1310,22 +1400,9 @@ def create_shipment_snapshot(
         any_open = False
         for index, item in enumerate(req.batches):
             pos = f"联单第 {index + 1} 项（batch_id={item.batch_id}）"
-            batch_row = db._select_batch(conn, item.batch_id)
-            if batch_row is None:
-                raise HTTPException(
-                    status_code=404, detail=f"{pos} 不存在，请先提交分析"
-                )
-            stored_batch = {
-                "batch": dict(batch_row),
-                "anomalies": db._select_anomalies(conn, item.batch_id),
-            }
-
-            # 重算并在同一事务内比对摘要：批次过期直接 409（事务随异常回滚，
-            # 旧口径行的重算覆盖也不会落库）。
-            _device_id, anomalies, profile_descriptor = (
-                _recompute_batch_conn(conn, stored_batch)
+            anomalies, current_digest = _recompute_shipment_batch_conn(
+                conn, item.batch_id, pos
             )
-            current_digest = _analysis_digest(anomalies, profile_descriptor)
             if current_digest != item.analysis_digest:
                 raise HTTPException(
                     status_code=409,
@@ -1335,51 +1412,10 @@ def create_shipment_snapshot(
                     ),
                 )
 
-            case = db.get_case_for_update(conn, item.case_id)
-            if case is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"{pos} 缺少处置：案件 case_id={item.case_id} 不存在，"
-                        "请先提交处置复核"
-                    ),
-                )
-            case_row = case["case"]
-            if case_row["batch_id"] != item.batch_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"{pos} 的案件 case_id={item.case_id} 实际属于批次 "
-                        f"{case_row['batch_id']}，案件与批次不匹配"
-                    ),
-                )
-            replaced_by = db.get_correction_by_original(conn, item.case_id)
-            if replaced_by is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"{pos} 的案件 case_id={item.case_id} 已被更正为案件 "
-                        f"{replaced_by['new_case_id']}，被替代案件不得用于"
-                        "新联单；请改用更正后的新案件"
-                    ),
-                )
-            if case_row["analysis_digest"] != current_digest:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"{pos} 的案件 case_id={item.case_id} 处置依据的快照"
-                        "与当前异常不一致，未覆盖当前异常"
-                    ),
-                )
-            covered = {d["seq"] for d in case["decisions"]}
-            if covered != set(range(len(anomalies))):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"{pos} 的案件 case_id={item.case_id} 处置未覆盖当前"
-                        f"全部异常（共 {len(anomalies)} 条）"
-                    ),
-                )
+            case_row = _check_case_for_shipment_conn(
+                conn, pos, item.batch_id, item.case_id,
+                current_digest, anomalies,
+            )
 
             if case_row["status"] == "open":
                 any_open = True
@@ -1414,6 +1450,293 @@ def create_shipment_snapshot(
         response.headers["X-Cache"] = "MISS"
         result_body = _build_shipment_response(
             {"shipment_id": req.shipment_id, "result": result},
+            [
+                {
+                    "seq": seq,
+                    "batch_id": batch_id,
+                    "case_id": case_id,
+                    "analysis_digest": digest,
+                    "handoff_at": handoff_at,
+                    "anomaly_count": anomaly_count,
+                    "case_status": case_status,
+                }
+                for seq, batch_id, case_id, digest, handoff_at,
+                anomaly_count, case_status in items
+            ],
+            cached=False,
+        )
+    return result_body
+
+
+# ---------- 联单换发 ----------
+
+
+def _reissue_content_hash(req: ShipmentReissueRequest) -> str:
+    """换发请求体（原单号、新单号、按批次排序的替换清单）的规范化哈希。
+
+    替换清单的顺序不影响请求身份（同一组 (batch_id, case_id) 替换即同一
+    换发）；原单号、新单号或任一替换案件变化都会得到不同哈希。
+    """
+    payload = {
+        "original_shipment_id": req.original_shipment_id,
+        "new_shipment_id": req.new_shipment_id,
+        "replacements": [
+            {"batch_id": r.batch_id, "case_id": r.case_id}
+            for r in sorted(req.replacements, key=lambda r: r.batch_id)
+        ],
+    }
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                           separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _waybill_content_hash(
+    shipment_id: str,
+    items: list[tuple[int, str, str, str, float, int, str]],
+) -> str:
+    """按普通建单口径计算新联单内容哈希（seq/batch/case/digest/handoff_at）。
+
+    新联单作为普通不可变联单落 ``shipments``：其 ``content_hash`` 与经
+    ``/api/v1/shipments/snapshot`` 提交同内容得到的逐字节一致，因此新单
+    同样支持同号幂等回放，换发关系另存于 ``shipment_reissues``。
+    """
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "shipment_id": shipment_id,
+                "batches": [
+                    {
+                        "batch_id": batch_id,
+                        "analysis_digest": digest,
+                        "case_id": case_id,
+                        "handoff_at": handoff_at,
+                    }
+                    for _seq, batch_id, case_id, digest, handoff_at,
+                    _anomaly_count, _case_status in items
+                ],
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _build_reissue_response(
+    original_shipment_id: str,
+    ship: dict[str, Any],
+    rows: list[dict[str, Any]],
+    cached: bool,
+) -> ShipmentReissueResponse:
+    return ShipmentReissueResponse(
+        original_shipment_id=original_shipment_id,
+        shipment_id=ship["shipment_id"],
+        cached=cached,
+        result=ship["result"],
+        batches=[
+            ShipmentBatchOut(
+                seq=r["seq"],
+                batch_id=r["batch_id"],
+                case_id=r["case_id"],
+                analysis_digest=r["analysis_digest"],
+                handoff_at=from_epoch(r["handoff_at"]),
+                anomaly_count=r["anomaly_count"],
+                case_status=r["case_status"],
+            )
+            for r in sorted(rows, key=lambda r: r["seq"])
+        ],
+    )
+
+
+@app.post(
+    "/api/v1/shipments/reissue",
+    response_model=ShipmentReissueResponse,
+)
+def reissue_shipment(
+    req: ShipmentReissueRequest, response: Response
+) -> ShipmentReissueResponse:
+    """案件更正后依据已有联单换发新联单；原单保持历史快照，新单逐批次核对。
+
+    请求给出原 ``shipment_id``、新 ``shipment_id`` 与需要替换的
+    ``(batch_id, case_id)`` 清单，至少一项案件实际变更。新单**沿用原单的
+    批次顺序与 ``handoff_at``**，未替换的案件照旧，不接受原单以外的批次。
+
+    服务在**同一 SQLite 事务**内逐批次：依据保存的原始采样重算异常与
+    ``analysis_digest`` → 核对新单中每个案件存在、属于对应批次、未被处置
+    更正替代、处置依据当前快照且覆盖全部当前异常（与普通建单同一套规则）。
+    替换批次不在原单、替换案件与原案件相同（无实际变更）、任一案件失效或
+    新单号已被占用时整体拒绝，绝不写入新单或换发关系。
+
+    全部通过后原子写入新联单与换发关系，按新单案件状态给出总体结果：
+    存在 open 案件为 held，否则 released。同一原联单只能换发一次；相同
+    请求幂等回放（``cached: true``），争用同一原单的其他请求返回 409；
+    新单作为普通不可变联单落库，本身可继续换发，原单内容及同号回放保持
+    历史快照。
+    """
+    content_hash = _reissue_content_hash(req)
+
+    with db.transaction() as conn:
+        original = db.get_shipment_for_update(
+            conn, req.original_shipment_id
+        )
+        if original is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"原联单 shipment_id={req.original_shipment_id} 不存在，"
+                    "请先通过运输联单接口出具原联单"
+                ),
+            )
+
+        reissue = db.get_shipment_reissue_by_original(
+            conn, req.original_shipment_id
+        )
+        if reissue is not None:
+            # 相同原单的换发：同内容幂等回放；换内容（含换新单号、换替换
+            # 案件）409——同一原单只能换发一次
+            if reissue["content_hash"] != content_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"原联单 shipment_id={req.original_shipment_id} 已换发为"
+                        f"联单 {reissue['new_shipment_id']}；同一原联单只能"
+                        "换发一次，如需再次换发请针对换发后的新联单提交"
+                    ),
+                )
+            new_shipment = db.get_shipment_for_update(
+                conn, reissue["new_shipment_id"]
+            )
+            assert new_shipment is not None
+            response.headers["X-Cache"] = "HIT"
+            return _build_reissue_response(
+                req.original_shipment_id,
+                new_shipment["shipment"],
+                new_shipment["batches"],
+                cached=True,
+            )
+
+        # 新单号必须全库唯一（含原单号自身、普通建单与历次换发生成的联单）
+        if db.get_shipment_for_update(conn, req.new_shipment_id) is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"new_shipment_id={req.new_shipment_id} 已被占用；"
+                    "换发生成的新联单号必须全库唯一"
+                ),
+            )
+
+        # 以原单批次行为底（顺序与 handoff_at 沿用），按 batch_id 建索引
+        original_rows = sorted(original["batches"], key=lambda r: r["seq"])
+        original_by_batch = {r["batch_id"]: r for r in original_rows}
+
+        # 换发只接受原单内的批次，且每项必须是实际变更（新案件 ≠ 原案件）
+        replacements: dict[str, str] = {}
+        for repl in req.replacements:
+            old_row = original_by_batch.get(repl.batch_id)
+            if old_row is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"替换批次 batch_id={repl.batch_id} 不在原联单 "
+                        f"{req.original_shipment_id} 的批次清单内；换发不接受"
+                        "原单以外的批次"
+                    ),
+                )
+            if repl.case_id == old_row["case_id"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"批次 batch_id={repl.batch_id} 的替换案件 case_id="
+                        f"{repl.case_id} 与原联单案件相同；换发要求至少一项"
+                        "案件实际变更，未变更的批次无需列入 replacements"
+                    ),
+                )
+            replacements[repl.batch_id] = repl.case_id
+
+        # 逐批次重算并核对新单案件（替换的或沿用的都必须当前有效），
+        # 任一项失效即 409，整个事务回滚，绝不写入新单或换发关系。
+        items: list[tuple[int, str, str, str, float, int, str]] = []
+        any_open = False
+        for row in original_rows:
+            batch_id = row["batch_id"]
+            case_id = replacements.get(batch_id, row["case_id"])
+            pos = f"换发联单批次项（batch_id={batch_id}）"
+            anomalies, current_digest = _recompute_shipment_batch_conn(
+                conn, batch_id, pos
+            )
+            case_row = _check_case_for_shipment_conn(
+                conn, pos, batch_id, case_id, current_digest, anomalies,
+            )
+            if case_row["status"] == "open":
+                any_open = True
+            # 顺序与 handoff_at 沿用原单；摘要/异常数/案件状态以重算结果为准
+            items.append(
+                (
+                    row["seq"],
+                    batch_id,
+                    case_id,
+                    current_digest,
+                    row["handoff_at"],
+                    len(anomalies),
+                    case_row["status"],
+                )
+            )
+
+        result = "held" if any_open else "released"
+        waybill_hash = _waybill_content_hash(req.new_shipment_id, items)
+
+        shipment_inserted = False
+        try:
+            db.save_shipment(
+                conn, req.new_shipment_id, waybill_hash, result, items
+            )
+            shipment_inserted = True
+            db.save_shipment_reissue(
+                conn,
+                original_shipment_id=req.original_shipment_id,
+                new_shipment_id=req.new_shipment_id,
+                content_hash=content_hash,
+            )
+        except sqlite3.IntegrityError as exc:
+            # 并发下同一原单的另一换发抢先落库，或新单号被抢先占用。
+            # 本事务已写入的新联单行先清理，保证拒绝路径不留下部分记录。
+            if shipment_inserted:
+                conn.execute(
+                    "DELETE FROM shipment_batches WHERE shipment_id = ?",
+                    (req.new_shipment_id,),
+                )
+                conn.execute(
+                    "DELETE FROM shipments WHERE shipment_id = ?",
+                    (req.new_shipment_id,),
+                )
+            reissue = db.get_shipment_reissue_by_original(
+                conn, req.original_shipment_id
+            )
+            if reissue is not None:
+                if reissue["content_hash"] != content_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="原联单已被其他换发请求占用",
+                    ) from exc
+                new_shipment = db.get_shipment_for_update(
+                    conn, reissue["new_shipment_id"]
+                )
+                assert new_shipment is not None
+                response.headers["X-Cache"] = "HIT"
+                return _build_reissue_response(
+                    req.original_shipment_id,
+                    new_shipment["shipment"],
+                    new_shipment["batches"],
+                    cached=True,
+                )
+            raise HTTPException(
+                status_code=409, detail="新联单号已被其他内容占用"
+            ) from exc
+
+        response.headers["X-Cache"] = "MISS"
+        result_body = _build_reissue_response(
+            req.original_shipment_id,
+            {"shipment_id": req.new_shipment_id, "result": result},
             [
                 {
                     "seq": seq,

@@ -11,6 +11,11 @@
 处置结论更正同样走 :func:`transaction`：核对原案件所属批次与重算摘要后，
 原子写入新案件与替代关系（``case_corrections``）。``original_case_id``
 主键保证同一原案件只能被更正一次，争用同一原案件的并发更正只有一个成功。
+
+联单换发同样走 :func:`transaction`：以原联单批次行（顺序与 handoff_at）为底，
+逐批次重算摘要并核对替换/沿用案件后，原子写入新联单与换发关系
+（``shipment_reissues``）。``original_shipment_id`` 主键保证同一原联单只能
+换发一次，争用同一原联单的并发换发只有一个成功。
 """
 
 from __future__ import annotations
@@ -163,6 +168,15 @@ def init_db() -> None:
                 case_status     TEXT NOT NULL
                                 CHECK (case_status IN ('open', 'closed')),
                 UNIQUE(shipment_id, seq)
+            );
+
+            CREATE TABLE IF NOT EXISTS shipment_reissues (
+                original_shipment_id TEXT PRIMARY KEY
+                                     REFERENCES shipments(shipment_id),
+                new_shipment_id      TEXT NOT NULL UNIQUE
+                                     REFERENCES shipments(shipment_id),
+                content_hash         TEXT NOT NULL,
+                created_at           REAL NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS calibration_profiles (
@@ -512,6 +526,40 @@ def save_shipment(
             for seq, batch_id, case_id, digest, handoff_at,
             anomaly_count, case_status in items
         ],
+    )
+
+
+# ---------- 联单换发 ----------
+
+
+def get_shipment_reissue_by_original(
+    conn: sqlite3.Connection, original_shipment_id: str
+) -> Optional[dict[str, Any]]:
+    """事务内按原联单号读取换发关系；未换发返回 None。"""
+    row = conn.execute(
+        "SELECT * FROM shipment_reissues WHERE original_shipment_id = ?",
+        (original_shipment_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def save_shipment_reissue(
+    conn: sqlite3.Connection,
+    original_shipment_id: str,
+    new_shipment_id: str,
+    content_hash: str,
+) -> None:
+    """在给定事务内写入换发关系（原联单 → 新联单）。
+
+    ``original_shipment_id`` 主键保证同一原联单只能换发一次；
+    ``new_shipment_id`` 唯一约束保证一张新联单只对应一次换发。约束冲突抛
+    IntegrityError，由调用方按幂等/争用规则处理。
+    """
+    conn.execute(
+        """INSERT INTO shipment_reissues
+           (original_shipment_id, new_shipment_id, content_hash, created_at)
+           VALUES (?, ?, ?, ?)""",
+        (original_shipment_id, new_shipment_id, content_hash, time.time()),
     )
 
 

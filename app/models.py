@@ -465,3 +465,60 @@ class ShipmentSnapshotResponse(BaseModel):
         ..., description="总体结果：全部案件 closed 为 released；存在 open 案件为 held"
     )
     batches: list[ShipmentBatchOut]
+
+
+# ---------- 联单换发 ----------
+
+
+class ShipmentReissueItemIn(BaseModel):
+    """换发请求中的一项案件替换：该批次（必须属于原联单）改用新案件。"""
+
+    batch_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="需要替换案件的批次号；必须在原联单批次清单内，否则整单 409",
+    )
+    case_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="替换后的案件号；必须与原单该批次案件不同（至少一项实际变更）",
+    )
+
+
+class ShipmentReissueRequest(BaseModel):
+    """联单换发：以原联单为底，仅替换指定批次的案件后出具新联单。
+
+    新单沿用原单的批次顺序与 ``handoff_at``，未替换的案件照旧；换发不接受
+    原单以外的批次，且至少一项案件实际变更。同一原联单只能换发一次，相同
+    请求幂等回放；新单本身可继续作为原单再换发。
+    """
+
+    original_shipment_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="原运输联单号；不存在返回 404，只能换发一次",
+    )
+    new_shipment_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="换发后的新联单号；全库唯一，已被占用（含与原单同号）返回 409",
+    )
+    replacements: list[ShipmentReissueItemIn] = Field(
+        ..., min_length=1,
+        description="需要替换的 (batch_id, case_id) 清单（至少 1 项，批次不可重复）",
+    )
+
+    @model_validator(mode="after")
+    def _validate_replacements(self) -> "ShipmentReissueRequest":
+        batch_ids = [r.batch_id for r in self.replacements]
+        if len(set(batch_ids)) != len(batch_ids):
+            raise ValueError("replacements 中 batch_id 不能重复")
+        return self
+
+
+class ShipmentReissueResponse(BaseModel):
+    original_shipment_id: str = Field(..., description="被换发的原联单号")
+    shipment_id: str = Field(..., description="换发生成的新联单号")
+    cached: bool = Field(..., description="true 表示相同换发请求幂等回放")
+    result: ShipmentResult = Field(
+        ..., description="按新单案件状态计算：全部 closed 为 released；存在 open 为 held"
+    )
+    batches: list[ShipmentBatchOut] = Field(
+        ..., description="新单批次（沿用原单顺序与 handoff_at，案件为替换后的有效案件）"
+    )
