@@ -23,6 +23,11 @@
   时间），服务在同一事务内逐批次重算核对快照、确认案件覆盖当前异常，
   全部通过才落库不可变联单，给出 `released`/`held` 结论；存在 open 案件
   即 held
+- 🔄 运输联单换发：案件更正后可凭原联单换发新联单，提交原/新联单号与
+  需要替换的批次、案件（至少一项实际变更）；新单沿用原单批次顺序与
+  `handoff_at`，未替换案件照旧，不接受原单以外批次；同一事务逐批重算
+  核对后原子写入，同一原单只能换发一次，相同请求幂等回放，争用返回
+  `409`，新联单可继续换发
 - 🌡️ 设备温度校准档案：提交按时间排序、互不重叠的 `[start,end)` 生效区间
   （有限正 `scale`/`offset`），分析可选按档案以 `corrected=raw*scale+offset`
   校准后再检测；档案标识与内容进入请求哈希与 `analysis_digest`，历史回放、
@@ -53,6 +58,7 @@ docker compose up --build -d
 | http://localhost:8000/api/v1/cases/review | 处置复核提交（POST） |
 | http://localhost:8000/api/v1/cases/correct | 处置结论更正（POST） |
 | http://localhost:8000/api/v1/shipments/snapshot | 运输联单风险快照（POST） |
+| http://localhost:8000/api/v1/shipments/reissue | 运输联单换发（POST） |
 
 停止：`docker compose down`（数据保留在命名卷 `coldchain-data`）。
 
@@ -651,6 +657,97 @@ curl -X POST http://localhost:8000/api/v1/shipments/snapshot \
 - **结构校验 `422`**：清单为空、`batch_id` 重复、`handoff_at` 未严格递增。
 - 批次不存在 → `404`（详情指明出问题的清单项）。
 
+## 运输联单换发
+
+案件经处置更正后，引用旧案件的联单需要重新出具。接口
+`POST /api/v1/shipments/reissue` 依据**已有联单**换发新联单：调用方给出
+原 `shipment_id`、新 `shipment_id` 以及需要替换的 (`batch_id`, `case_id`)
+清单。新单**沿用原单的批次顺序与 `handoff_at`**，未替换的案件照旧；
+替换清单中至少一项案件实际变更，且不接受原联单以外的批次。服务在
+**同一 SQLite 事务**内逐批次重算 `analysis_digest`，核对新单中每个案件
+属于对应批次、覆盖当前异常且未被更正替代；任何一项失效，或新联单号
+已被占用，都不得写入新单或换发关系（整体回滚，不留部分记录）。
+
+- **同一原联单只能换发一次**：再次换发请针对换发出的新联单提交；
+  争用同一原联单的其他换发请求返回 `409`。
+- **相同请求幂等回放**：原联单号、新联单号与替换清单逐字节一致时
+  `cached: true`、`X-Cache: HIT`（替换项顺序无关，按 `batch_id` 排序
+  规范化）；换新联单号、增删替换批次或换案件均属不同请求，返回 `409`。
+- **原联单保持历史快照**：原联单内容与其同号幂等回放不受换发影响，
+  即使它引用的案件后来被更正替代。
+- **新联单是普通不可变联单**：按新单案件状态计算 `released`/`held`
+  （存在 open 案件即 held）；可在快照接口按同内容幂等回放、换内容
+  `409`，且自身可继续换发（形成换发链，交接时间始终沿用最初原单）。
+
+```bash
+# 前提：SHP-2026-09-22-01 已存在（含批次 TRIP-001、TRIP-002），
+# 案件 CASE-A 已更正为 CASE-AR（见“处置结论更正”）。
+# 换发时只需给出要替换的批次与新案件，未列出的批次案件照旧。
+curl -X POST http://localhost:8000/api/v1/shipments/reissue \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "original_shipment_id": "SHP-2026-09-22-01",
+    "new_shipment_id": "SHP-2026-09-22-01R",
+    "replacements": [
+      {"batch_id": "TRIP-001", "case_id": "CASE-AR"}
+    ]
+  }'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `original_shipment_id` | 原联单号；不存在返回 `404`，同一原联单只能换发一次 |
+| `new_shipment_id` | 新联单号；已被任何联单占用（含与原单同号）返回 `409`；新单可继续换发 |
+| `replacements[]` | 替换清单（至少 1 项，`batch_id` 不可重复）；未列出的批次案件照旧 |
+| `replacements[].batch_id` | 要替换案件的批次号；不在原联单清单中返回 `409` |
+| `replacements[].case_id` | 该批次上的新案件号；须属于该批次、覆盖当前全部异常且未被替代，否则 `409` |
+| 实际变更 | 至少一项替换必须指向与原联单不同的案件；全部同号（无实际变更）返回 `409` |
+
+成功响应（`TRIP-002` 案件照旧；原 held 若因更正全部闭环则新单 `released`）：
+
+```json
+{
+  "original_shipment_id": "SHP-2026-09-22-01",
+  "shipment_id": "SHP-2026-09-22-01R",
+  "cached": false,
+  "result": "released",
+  "batches": [
+    {
+      "seq": 0,
+      "batch_id": "TRIP-001",
+      "case_id": "CASE-AR",
+      "analysis_digest": "a1f9…（同一事务内按原始采样重算的当前摘要）",
+      "handoff_at": "2026-09-22T10:00:00.000Z",
+      "anomaly_count": 1,
+      "case_status": "closed"
+    },
+    {
+      "seq": 1,
+      "batch_id": "TRIP-002",
+      "case_id": "CASE-B",
+      "analysis_digest": "b7e2…",
+      "handoff_at": "2026-09-22T14:00:00.000Z",
+      "anomaly_count": 2,
+      "case_status": "closed"
+    }
+  ]
+}
+```
+
+换发语义与错误码：
+
+- **批次/案件核对 `409`**：替换案件（或未替换批次上的旧案件）不存在、
+  属于其他批次、已被更正替代、处置依据的快照与当前重算摘要不一致，或
+  处置未覆盖当前全部异常——任一清单项失效即整单回滚，详情可定位到
+  新联单的具体批次。
+- **原单以外批次 `409`**：`replacements[].batch_id` 不在原联单清单中。
+- **无实际变更 `409`**：替换项没有把任何批次改成不同案件。
+- **原单已换发/新单号占用 `409`**：同一原联单只能换发一次；新联单号
+  必须全库唯一。原联单不存在 → `404`。
+- **结构校验 `422`**：`replacements` 为空/缺失、其中 `batch_id` 重复。
+
 ## 参数校验（422）
 
 分析请求：
@@ -693,11 +790,11 @@ COLDCHAIN_DB=/tmp/test.db .venv/bin/python -m unittest discover -s tests -v
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由、序列化、幂等编排、校准档案、拟更正预演、复核/更正/联单事务
+│   ├── main.py        # FastAPI 路由、序列化、幂等编排、校准档案、拟更正预演、复核/更正/联单/换发事务
 │   ├── detection.py   # 核心检测/合并/拆段/归因/校准算法（纯函数，无 IO）
 │   ├── models.py      # Pydantic 请求/响应模型与时间转换
-│   └── db.py          # SQLite 连接、建表、批次/案件/更正/联单/档案读写与事务
-├── tests/             # unittest 算法与 API 测试（118 个用例，含校准档案、拟更正预演、快照绑定、复核/更正与联单幂等）
+│   └── db.py          # SQLite 连接、建表、批次/案件/更正/联单/换发/档案读写与事务
+├── tests/             # unittest 算法与 API 测试（141 个用例，含校准档案、拟更正预演、快照绑定、复核/更正、联单与换发幂等）
 ├── vendor/            # 本地依赖 wheel（离线安装）
 ├── requirements.txt
 ├── Dockerfile         # pip --no-index 离线安装

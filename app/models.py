@@ -465,3 +465,68 @@ class ShipmentSnapshotResponse(BaseModel):
         ..., description="总体结果：全部案件 closed 为 released；存在 open 案件为 held"
     )
     batches: list[ShipmentBatchOut]
+
+
+# ---------- 运输联单换发 ----------
+
+
+class ShipmentReissueItemIn(BaseModel):
+    """换发请求中一项案件替换：用新案件替换原联单对应批次上的旧案件。"""
+
+    batch_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="需要替换案件的批次号；必须是原联单中的批次，否则 409",
+    )
+    case_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="该批次上的新案件号；须属于该批次、覆盖当前异常且未被替代",
+    )
+
+
+class ShipmentReissueRequest(BaseModel):
+    """联单换发：依据已有联单换发新联单，仅替换指定批次上的案件。
+
+    新联单沿用原联单的批次顺序与交接时间；至少一项案件实际变更；
+    不接受原联单以外的批次。
+    """
+
+    original_shipment_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="原联单号；不存在返回 404，同一原联单只能换发一次",
+    )
+    new_shipment_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="新联单号；已被任何联单占用返回 409，换发出的新联单可继续换发",
+    )
+    replacements: list[ShipmentReissueItemIn] = Field(
+        ..., min_length=1,
+        description=(
+            "需要替换的批次与新案件（至少 1 项，批次不可重复）；"
+            "未列出的批次案件照旧"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_replacements(self) -> "ShipmentReissueRequest":
+        batch_ids = [r.batch_id for r in self.replacements]
+        if len(set(batch_ids)) != len(batch_ids):
+            raise ValueError("replacements 中 batch_id 不能重复")
+        return self
+
+
+class ShipmentReissueResponse(BaseModel):
+    original_shipment_id: str = Field(
+        ..., description="被换发的原联单号（原联单内容保持历史快照）"
+    )
+    shipment_id: str = Field(..., description="换发生成的新联单号")
+    cached: bool = Field(..., description="true 表示相同换发请求幂等回放")
+    result: ShipmentResult = Field(
+        ..., description="新联单总体结果：全部案件 closed 为 released；存在 open 案件为 held"
+    )
+    batches: list[ShipmentBatchOut] = Field(
+        ...,
+        description=(
+            "新联单批次清单：沿用原联单批次顺序与交接时间；"
+            "替换批次引用新案件，其余批次照旧"
+        ),
+    )
